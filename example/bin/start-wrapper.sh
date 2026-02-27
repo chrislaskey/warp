@@ -32,6 +32,8 @@ SERVER_PID_FILE="/tmp/server.pid"
 RELEASES_DIR="/app/releases"
 CURRENT_LINK="/app/current"
 HEALTHCHECK="/app/bin/healthcheck.sh"
+GIT_POLL_SCRIPT="/app/bin/git-poll.sh"
+GIT_POLL_PID=""
 
 # Number of consecutive failures before rolling back to the previous release.
 FAILURE_THRESHOLD=3
@@ -89,8 +91,18 @@ rollback() {
 # Signal handlers
 # ---------------------------------------------------------------------------
 
+stop_git_poll() {
+  if [ -n "$GIT_POLL_PID" ]; then
+    echo "[wrapper] Stopping git-poll (pid $GIT_POLL_PID)..."
+    kill "$GIT_POLL_PID" 2>/dev/null || true
+    wait "$GIT_POLL_PID" 2>/dev/null || true
+    GIT_POLL_PID=""
+  fi
+}
+
 cleanup() {
   echo "[wrapper] Shutdown signal received."
+  stop_git_poll
   stop_server
   echo "[wrapper] Exiting."
   exit 0
@@ -109,6 +121,19 @@ restart_server() {
 
 trap cleanup TERM INT
 trap restart_server USR1
+
+# ---------------------------------------------------------------------------
+# Start git polling (if configured via GIT_REPO_URL and GIT_BRANCH env vars)
+# ---------------------------------------------------------------------------
+
+if [ -n "$GIT_REPO_URL" ] && [ -n "$GIT_BRANCH" ]; then
+  echo "[wrapper] Git polling configured: branch '$GIT_BRANCH' from $GIT_REPO_URL"
+  "$GIT_POLL_SCRIPT" &
+  GIT_POLL_PID=$!
+  echo "[wrapper] git-poll started (pid $GIT_POLL_PID)."
+else
+  echo "[wrapper] Git polling not configured (set GIT_REPO_URL and GIT_BRANCH to enable)."
+fi
 
 # ---------------------------------------------------------------------------
 # Main loop

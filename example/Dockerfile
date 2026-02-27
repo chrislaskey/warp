@@ -99,7 +99,8 @@ RUN mix release --path /app/releases/1 \
 COPY bin/start-wrapper.sh /app/bin/start-wrapper.sh
 COPY bin/rebuild.sh /app/bin/rebuild.sh
 COPY bin/healthcheck.sh /app/bin/healthcheck.sh
-RUN chmod +x /app/bin/start-wrapper.sh /app/bin/rebuild.sh /app/bin/healthcheck.sh
+COPY bin/git-poll.sh /app/bin/git-poll.sh
+RUN chmod +x /app/bin/start-wrapper.sh /app/bin/rebuild.sh /app/bin/healthcheck.sh /app/bin/git-poll.sh
 
 # --- Security hardening (commented out for iterative development) ---
 # Once the development pattern is finalized, uncomment these lines to
