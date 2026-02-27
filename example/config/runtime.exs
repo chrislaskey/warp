@@ -46,11 +46,13 @@ if config_env() == :prod do
 
   host = System.get_env("PHX_HOST") || "example.com"
   port = String.to_integer(System.get_env("PORT") || "4000")
+  scheme = System.get_env("PHX_SCHEME") || "https"
+  url_port = if scheme == "https", do: 443, else: port
 
   config :example, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
   config :example, ExampleWeb.Endpoint,
-    url: [host: host, port: 443, scheme: "https"],
+    url: [host: host, port: url_port, scheme: scheme],
     http: [
       # Enable IPv6 and bind on all interfaces.
       # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.
