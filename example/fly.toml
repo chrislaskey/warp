@@ -21,6 +21,11 @@ kill_signal = 'SIGTERM'
   auto_extend_size_increment = '1GB'
   auto_extend_size_limit = '10GB'
 
+[deploy]
+  # The single-stage image includes build tools and runs migrations before
+  # starting the server, so startup takes longer than the default timeout.
+  release_timeout = 120
+
 [http_service]
   internal_port = 8080
   force_https = true
@@ -34,7 +39,14 @@ kill_signal = 'SIGTERM'
     hard_limit = 1000
     soft_limit = 1000
 
+  [[http_service.checks]]
+    grace_period = '30s'
+    interval = '15s'
+    timeout = '10s'
+    method = 'GET'
+    path = '/'
+
 [[vm]]
-  memory = '256mb'
+  memory = '512mb'
   cpus = 1
-  memory_mb = 256
+  memory_mb = 512
