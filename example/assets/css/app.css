@@ -102,8 +102,4 @@
 /* Make LiveView wrapper divs transparent for layout */
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
-div {
-  opacity: 0.5;
-}
-
 /* This file is for your main application CSS */
