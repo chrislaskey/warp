@@ -20,6 +20,7 @@ REBUILD_SCRIPT="$APP_DIR/bin/rebuild.sh"
 REBUILD_LOCK="/tmp/git-poll-rebuild.lock"
 RECONCILE_PATHS_FILE="/tmp/git-poll-reconcile-paths.txt"
 GIT_POLL_INTERVAL="${GIT_POLL_INTERVAL:-1}"
+GIT_REPO_SUBDIR="${GIT_REPO_SUBDIR:-}"
 
 # ---------------------------------------------------------------------------
 # Guard: exit early if not configured
@@ -82,6 +83,50 @@ echo "[git-poll] Baseline commit: ${START_SHA} on ${GIT_BRANCH}"
 echo "[git-poll] Polling every ${GIT_POLL_INTERVAL}s for new commits..."
 rm -f "$RECONCILE_PATHS_FILE"
 
+REMOTE_PATH_PREFIX=""
+
+detect_remote_path_prefix() {
+  if [ -n "$GIT_REPO_SUBDIR" ]; then
+    REMOTE_PATH_PREFIX="$GIT_REPO_SUBDIR"
+    # Normalize to no leading/trailing slash.
+    REMOTE_PATH_PREFIX=$(echo "$REMOTE_PATH_PREFIX" | sed 's#^/*##; s#/*$##')
+    echo "[git-poll] Using configured repo subdir prefix: '${REMOTE_PATH_PREFIX}/'"
+    return 0
+  fi
+
+  # Auto-detect common case: monorepo with app under "example/".
+  if git cat-file -e "${CURRENT_SHA}:example/mix.exs" 2>/dev/null; then
+    REMOTE_PATH_PREFIX="example"
+    echo "[git-poll] Auto-detected repo subdir prefix: '${REMOTE_PATH_PREFIX}/'"
+    return 0
+  fi
+
+  REMOTE_PATH_PREFIX=""
+  echo "[git-poll] Repo root appears to match /app (no path prefix)."
+  return 0
+}
+
+to_local_path() {
+  REMOTE_PATH="$1"
+
+  if [ -z "$REMOTE_PATH_PREFIX" ]; then
+    printf "%s\n" "$REMOTE_PATH"
+    return 0
+  fi
+
+  case "$REMOTE_PATH" in
+    "$REMOTE_PATH_PREFIX"/*)
+      printf "%s\n" "${REMOTE_PATH#"$REMOTE_PATH_PREFIX"/}"
+      return 0
+      ;;
+    *)
+      # Path is outside the selected app subtree; ignore it.
+      printf "%s\n" ""
+      return 0
+      ;;
+  esac
+}
+
 append_changed_paths() {
   FROM_SHA="$1"
   TO_SHA="$2"
@@ -100,15 +145,30 @@ append_changed_paths() {
     return 0
   fi
 
-  if [ -f "$RECONCILE_PATHS_FILE" ]; then
-    cat "$RECONCILE_PATHS_FILE" "$CHANGED_LIST" | sed '/^$/d' | sort -u > "$MERGED_LIST"
-    mv "$MERGED_LIST" "$RECONCILE_PATHS_FILE"
-  else
-    mv "$CHANGED_LIST" "$RECONCILE_PATHS_FILE"
-    CHANGED_LIST=""
+  FILTERED_LIST="/tmp/git-poll-filtered-paths.$$"
+  : > "$FILTERED_LIST"
+
+  while IFS= read -r REMOTE_PATH; do
+    [ -z "$REMOTE_PATH" ] && continue
+    LOCAL_PATH=$(to_local_path "$REMOTE_PATH")
+    [ -z "$LOCAL_PATH" ] && continue
+    printf "%s\n" "$LOCAL_PATH" >> "$FILTERED_LIST"
+  done < "$CHANGED_LIST"
+
+  if [ ! -s "$FILTERED_LIST" ]; then
+    rm -f "$CHANGED_LIST" "$FILTERED_LIST"
+    return 0
   fi
 
-  rm -f "$CHANGED_LIST"
+  if [ -f "$RECONCILE_PATHS_FILE" ]; then
+    cat "$RECONCILE_PATHS_FILE" "$FILTERED_LIST" | sed '/^$/d' | sort -u > "$MERGED_LIST"
+    mv "$MERGED_LIST" "$RECONCILE_PATHS_FILE"
+  else
+    mv "$FILTERED_LIST" "$RECONCILE_PATHS_FILE"
+    FILTERED_LIST=""
+  fi
+
+  rm -f "$CHANGED_LIST" "$FILTERED_LIST"
   return 0
 }
 
@@ -127,10 +187,40 @@ reconcile_tracked_paths() {
   while IFS= read -r PATHNAME; do
     [ -z "$PATHNAME" ] && continue
 
-    # If the path exists in TO_SHA, write that version to disk.
-    if git cat-file -e "${TO_SHA}:${PATHNAME}" 2>/dev/null; then
-      if ! git checkout -q "$TO_SHA" -- "$PATHNAME"; then
-        echo "[git-poll] ERROR: Failed to update path: ${PATHNAME}"
+    REMOTE_PATH="$PATHNAME"
+    if [ -n "$REMOTE_PATH_PREFIX" ]; then
+      REMOTE_PATH="$REMOTE_PATH_PREFIX/$PATHNAME"
+    fi
+
+    # If the path exists in TO_SHA, write that version to local disk.
+    if git cat-file -e "${TO_SHA}:${REMOTE_PATH}" 2>/dev/null; then
+      OBJ_TYPE=$(git cat-file -t "${TO_SHA}:${REMOTE_PATH}" 2>/dev/null || true)
+      MODE=$(git ls-tree "$TO_SHA" -- "$REMOTE_PATH" | awk 'NR==1 {print $1}')
+
+      mkdir -p "$(dirname "$PATHNAME")"
+
+      if [ "$OBJ_TYPE" = "blob" ] && [ "$MODE" = "120000" ]; then
+        # Symlink: blob contents are the symlink target path.
+        TARGET=$(git show "${TO_SHA}:${REMOTE_PATH}")
+        rm -f "$PATHNAME"
+        if ! ln -s "$TARGET" "$PATHNAME"; then
+          echo "[git-poll] ERROR: Failed to write symlink: ${PATHNAME}"
+          FAILED=1
+          break
+        fi
+      elif [ "$OBJ_TYPE" = "blob" ]; then
+        if ! git show "${TO_SHA}:${REMOTE_PATH}" > "$PATHNAME"; then
+          echo "[git-poll] ERROR: Failed to write file: ${PATHNAME}"
+          FAILED=1
+          break
+        fi
+        if [ "$MODE" = "100755" ]; then
+          chmod 755 "$PATHNAME" 2>/dev/null || true
+        else
+          chmod 644 "$PATHNAME" 2>/dev/null || true
+        fi
+      else
+        echo "[git-poll] WARN: Unsupported object type '${OBJ_TYPE}' for ${REMOTE_PATH}; skipping."
         FAILED=1
         break
       fi
@@ -143,6 +233,8 @@ reconcile_tracked_paths() {
 
   [ "$FAILED" -eq 0 ]
 }
+
+detect_remote_path_prefix
 
 reconcile_changed_paths() {
   FROM_SHA="$1"

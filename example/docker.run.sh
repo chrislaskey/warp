@@ -13,5 +13,6 @@ docker run --rm \
   -e GIT_BRANCH=$GIT_BRANCH \
   -e GIT_TOKEN=$GIT_TOKEN \
   -e GIT_POLL_INTERVAL=$GIT_POLL_INTERVAL \
+  -e GIT_REPO_SUBDIR=$GIT_REPO_SUBDIR \
   -p 4000:4000 \
   warp-example
