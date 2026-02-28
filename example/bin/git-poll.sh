@@ -2,8 +2,8 @@
 # git-poll.sh — poll a Git remote for new commits and rebuild on changes
 #
 # Runs as a background process inside the container. When new commits are
-# detected on the configured branch, pulls the changes and runs rebuild.sh
-# to create and deploy a new release.
+# detected on the configured branch, reconciles changed files and runs
+# rebuild.sh to create and deploy a new release.
 #
 # Environment variables:
 #   GIT_REPO_URL       — Repository HTTPS URL. Required for polling to start.
@@ -18,6 +18,7 @@
 APP_DIR="/app"
 REBUILD_SCRIPT="$APP_DIR/bin/rebuild.sh"
 REBUILD_LOCK="/tmp/git-poll-rebuild.lock"
+RECONCILE_PATHS_FILE="/tmp/git-poll-reconcile-paths.txt"
 GIT_POLL_INTERVAL="${GIT_POLL_INTERVAL:-1}"
 
 # ---------------------------------------------------------------------------
@@ -45,12 +46,15 @@ fi
 # Initialize a git repo in /app
 #
 # The Docker image was built via COPY commands so there is no .git directory.
-# We initialize a fresh repo, add the remote, and do a shallow fetch of just
-# the target branch. This gives us the minimal history needed to detect and
-# pull new commits.
+# We initialize a fresh repo, add the remote, and fetch the target branch.
 #
-# Existing untracked directories (_build/, deps/, releases/, current) are
-# not affected by git reset --hard — it only updates tracked files.
+# Update strategy:
+# - Track changed paths incrementally between CURRENT_SHA..LATEST_SHA.
+# - Keep a cumulative set of touched paths.
+# - Reconcile that path set to LATEST_SHA.
+#
+# This avoids rebase/reset while still handling later commits that revert
+# earlier edits.
 # ---------------------------------------------------------------------------
 
 cd "$APP_DIR"
@@ -73,8 +77,87 @@ if ! git fetch --depth=1 origin "$GIT_BRANCH" 2>&1; then
 fi
 
 CURRENT_SHA=$(git rev-parse FETCH_HEAD)
-echo "[git-poll] Baseline commit: ${CURRENT_SHA} on ${GIT_BRANCH}"
+START_SHA="$CURRENT_SHA"
+echo "[git-poll] Baseline commit: ${START_SHA} on ${GIT_BRANCH}"
 echo "[git-poll] Polling every ${GIT_POLL_INTERVAL}s for new commits..."
+rm -f "$RECONCILE_PATHS_FILE"
+
+append_changed_paths() {
+  FROM_SHA="$1"
+  TO_SHA="$2"
+  CHANGED_LIST="/tmp/git-poll-changed-paths.$$"
+  MERGED_LIST="/tmp/git-poll-merged-paths.$$"
+
+  # --no-renames emits delete+add paths for renames, which keeps reconciliation simple.
+  if ! git diff --name-only --no-renames "$FROM_SHA" "$TO_SHA" > "$CHANGED_LIST"; then
+    echo "[git-poll] ERROR: Failed to diff ${FROM_SHA}..${TO_SHA}."
+    rm -f "$CHANGED_LIST"
+    return 1
+  fi
+
+  if [ ! -s "$CHANGED_LIST" ]; then
+    rm -f "$CHANGED_LIST"
+    return 0
+  fi
+
+  if [ -f "$RECONCILE_PATHS_FILE" ]; then
+    cat "$RECONCILE_PATHS_FILE" "$CHANGED_LIST" | sed '/^$/d' | sort -u > "$MERGED_LIST"
+    mv "$MERGED_LIST" "$RECONCILE_PATHS_FILE"
+  else
+    mv "$CHANGED_LIST" "$RECONCILE_PATHS_FILE"
+    CHANGED_LIST=""
+  fi
+
+  rm -f "$CHANGED_LIST"
+  return 0
+}
+
+reconcile_tracked_paths() {
+  TO_SHA="$1"
+
+  if [ ! -f "$RECONCILE_PATHS_FILE" ] || [ ! -s "$RECONCILE_PATHS_FILE" ]; then
+    echo "[git-poll] No changed paths to reconcile."
+    return 0
+  fi
+
+  PATH_COUNT=$(wc -l < "$RECONCILE_PATHS_FILE" | tr -d ' ')
+  echo "[git-poll] Reconciling ${PATH_COUNT} cumulative changed path(s)..."
+
+  FAILED=0
+  while IFS= read -r PATHNAME; do
+    [ -z "$PATHNAME" ] && continue
+
+    # If the path exists in TO_SHA, write that version to disk.
+    if git cat-file -e "${TO_SHA}:${PATHNAME}" 2>/dev/null; then
+      if ! git checkout -q "$TO_SHA" -- "$PATHNAME"; then
+        echo "[git-poll] ERROR: Failed to update path: ${PATHNAME}"
+        FAILED=1
+        break
+      fi
+      continue
+    fi
+
+    # Otherwise the path was deleted in TO_SHA; remove local file if present.
+    rm -f "$PATHNAME" 2>/dev/null || true
+  done < "$RECONCILE_PATHS_FILE"
+
+  [ "$FAILED" -eq 0 ]
+}
+
+reconcile_changed_paths() {
+  FROM_SHA="$1"
+  TO_SHA="$2"
+
+  if ! append_changed_paths "$FROM_SHA" "$TO_SHA"; then
+    return 1
+  fi
+
+  if ! reconcile_tracked_paths "$TO_SHA"; then
+    return 1
+  fi
+
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Poll loop
@@ -103,20 +186,15 @@ while true; do
   # Skip if a rebuild is already in progress
   if [ -f "$REBUILD_LOCK" ]; then
     echo "[git-poll] Rebuild already in progress (lock file exists). Skipping this cycle."
-    # Still update CURRENT_SHA — when the current rebuild finishes and a newer
-    # commit exists, the next cycle will pick it up.
-    CURRENT_SHA="$LATEST_SHA"
     continue
   fi
 
   echo "$$" > "$REBUILD_LOCK"
 
-  # Update the working tree to match the new commit.
-  echo "[git-poll] Resetting working tree to ${LATEST_SHA}..."
-  if ! git reset --hard FETCH_HEAD; then
-    echo "[git-poll] ERROR: git reset --hard failed."
+  # Reconcile cumulative changed paths to match the latest commit.
+  if ! reconcile_changed_paths "$CURRENT_SHA" "$LATEST_SHA"; then
+    echo "[git-poll] ERROR: File reconciliation failed."
     rm -f "$REBUILD_LOCK"
-    CURRENT_SHA="$LATEST_SHA"
     continue
   fi
 
