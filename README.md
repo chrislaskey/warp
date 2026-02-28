@@ -2,6 +2,11 @@
 
 Patterns for rapidly iterating on remote Elixir docker instances.
 
+## Implementation guides
+
+- `implementation-guides/warp-dockerfile-pattern.md`
+- `implementation-guides/warp-github-poll-pattern.md`
+
 ## Pattern 1
 
 ### Reusable build environment
@@ -38,3 +43,37 @@ Docker container exiting.
 
 If the wrapper script detects failures in the new release, it can be updated to
 rollback to he previous release.
+
+## Pattern 2
+
+### GitHub pull
+
+The second pattern layers on top of Pattern 1 by adding a background polling
+process inside the container.
+
+The process watches a branch in GitHub, detects new commits, reconciles changed
+files in `/app`, and runs the rebuild script.
+
+This gives a simple flow:
+
+- edit code locally
+- push to GitHub
+- container detects commit
+- container rebuilds and restarts
+
+### File-level reconciliation
+
+Recompilation of Elixir projects inside Docker containers can be tricky to get right. Sometimes there are longer recompilation loops. Sometimes, it fails.
+
+To try to reduce that risk, instead of `git rebase` or `git reset` in the running container, this pattern tracks changed paths and updates only those paths to the latest commit state.
+
+That keeps the update path explicit and avoids full tree rewrite behavior that
+can lead to unstable compile behavior in iterative container workflows.
+
+### Monorepo path mapping
+
+When the app is in a subdirectory (for example `example/`), paths from GitHub
+must be mapped to `/app`.
+
+Set `GIT_REPO_SUBDIR` so a remote path like `example/lib/...` is written to
+`/app/lib/...` instead of `/app/example/lib/...`.
